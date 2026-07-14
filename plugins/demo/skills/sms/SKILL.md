@@ -1,23 +1,48 @@
 ---
 name: sms
-description: Analyze Michaels SMS campaign performance for a given fiscal week. Includes total sends, clicks, click rate, subscriber count, and segment breakdown (Mass vs Journey/Trigger). Renders an HTML dashboard.
+description: Analyze Michaels SMS campaign performance for a given week or date. Includes total sends, clicks, click rate, subscriber count, and segment breakdown (Mass vs Journey/Trigger). Renders an HTML dashboard.
 ---
 
 # Michaels SMS Analysis
 
-## Step 0: Ask for the fiscal week
+## Step 0: Ask for the time period
 
 **Always ask first:**
 
-> "Which fiscal week would you like to analyze? Please provide the fiscal week ID (e.g., `202620` for week 20 of fiscal year 2026)."
-
-Substitute the user's input as `{input_week}` in the queries below.
+> "Which week would you like to analyze? You can give me:
+> - A specific date (e.g., `2026-05-15`) — I'll find the fiscal week automatically
+> - A week description (e.g., 'this week', 'last week', 'week of June 10')
+> - A fiscal week ID directly (e.g., `202620`)"
 
 ---
 
-## Queries (run all in parallel)
+## Step 1: Resolve fiscal week ID
 
-### Q1 — Overall Metrics
+If the user provides a date or description (not a fiscal week ID), run this first:
+
+```sql
+SELECT DISTINCT wk_idnt,
+    MIN(day_dt) AS week_start,
+    MAX(day_dt) AS week_end
+FROM cdp_unification_mk.bq_date_dim
+WHERE CAST(day_dt AS DATE) = DATE '{input_date}'
+GROUP BY 1;
+```
+
+Also fetch the date range for the week label:
+```sql
+SELECT MIN(day_dt) AS week_start, MAX(day_dt) AS week_end
+FROM cdp_unification_mk.bq_date_dim
+WHERE wk_idnt = '{input_week}';
+```
+
+Use the returned `wk_idnt` as `{input_week}` in the queries below.
+
+---
+
+## Step 2: Run queries in parallel
+
+### Q1 — Overall Metrics + Segment Breakdown
 ```sql
 WITH TY_week_messages AS (
     SELECT DISTINCT message_name
@@ -61,11 +86,11 @@ segment_summary AS (
 ),
 total_summary AS (
     SELECT
-        SUM(total_sends) AS total_sends,
-        SUM(total_clicks) AS total_clicks,
-        ROUND(100.0 * SUM(total_clicks) / NULLIF(SUM(total_sends), 0), 2) AS click_rate_pct,
+        SUM(sends) AS total_sends,
+        SUM(clicks) AS total_clicks,
+        ROUND(100.0 * SUM(clicks) / NULLIF(SUM(sends), 0), 2) AS click_rate_pct,
         COUNT(DISTINCT phone) AS unique_recipients
-    FROM (SELECT phone, SUM(sends) AS total_sends, SUM(clicks) AS total_clicks FROM SMS_Raw GROUP BY 1) t
+    FROM (SELECT phone, SUM(sends) AS sends, SUM(clicks) AS clicks FROM SMS_Raw GROUP BY 1) t
 )
 SELECT 'TOTAL' AS segment, total_sends, total_clicks, click_rate_pct, unique_recipients
 FROM total_summary
@@ -90,7 +115,7 @@ WHERE CAST(b.wk_idnt AS INT) <= CAST('{input_week}' AS INT)
 
 Render a clean single-page HTML dashboard with:
 
-**Header:** "SMS Performance — Fiscal Week {input_week}"
+**Header:** "SMS Performance — Fiscal Week {input_week} ({week_start} → {week_end})"
 
 **KPI Cards (row of 4):**
 - Total Sends
@@ -109,4 +134,3 @@ Render a clean single-page HTML dashboard with:
 **Bar Chart:** Sends vs Clicks side-by-side for Mass and Journey/Trigger segments.
 
 **Design:** Professional, clean, minimal. Neutral palette. Use inline CSS — no external dependencies.
-
