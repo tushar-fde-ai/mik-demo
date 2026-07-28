@@ -1,136 +1,281 @@
 ---
 name: sms
-description: Analyze Michaels SMS campaign performance for a given week or date. Includes total sends, clicks, click rate, subscriber count, and segment breakdown (Mass vs Journey/Trigger). Renders an HTML dashboard.
+description: Analyze Michaels SMS campaign performance for a specific campaign. Includes sends, clicks, click rate, click-attributed revenue and transactions, and baseline comparison vs similar-size campaigns in the last 90 days. Renders an HTML dashboard.
 ---
 
-# Michaels SMS Analysis
-
-## Step 0: Ask for the time period
-
-**Always ask first:**
-
-> "Which week would you like to analyze? You can give me:
-> - A specific date (e.g., `2026-05-15`) — I'll find the fiscal week automatically
-> - A week description (e.g., 'this week', 'last week', 'week of June 10')
-> - A fiscal week ID directly (e.g., `202620`)"
+# Michaels SMS Campaign Analysis
 
 ---
 
-## Step 1: Resolve fiscal week ID
+## Step 0: Campaign Selection (ALWAYS run first)
 
-If the user provides a date or description (not a fiscal week ID), run this first:
+**Ask the user:**
 
+> "Which SMS campaign would you like to analyze?
+> - **Name a campaign directly** — paste the message name (e.g. `MASS_SummerClearanceEndingSoon`)
+> - **Show me recent campaigns** — I'll pull the last 15 mass SMS campaigns with sends and clicks"
+
+**This skill analyzes one campaign at a time.**
+
+### If user wants recent campaigns:
 ```sql
-SELECT DISTINCT wk_idnt,
-    MIN(day_dt) AS week_start,
-    MAX(day_dt) AS week_end
-FROM cdp_unification_mk.bq_date_dim
-WHERE CAST(day_dt AS DATE) = DATE '{input_date}'
-GROUP BY 1;
+SELECT
+    message_name,
+    MIN(substring(timestamp,1,10)) AS send_date,
+    COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN phone END) AS sends,
+    COUNT(DISTINCT CASE WHEN type = 'MESSAGE_LINK_CLICK' THEN phone END) AS clicks,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN type = 'MESSAGE_LINK_CLICK' THEN phone END)
+        / NULLIF(COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN phone END), 0), 2) AS click_rate_pct
+FROM mk_src.attentive_general_histunion
+WHERE type IN ('MESSAGE_RECEIPT','MESSAGE_LINK_CLICK')
+  AND (upper(message_name) LIKE 'MASS%' OR upper(message_name) LIKE 'PROMO%')
+  AND lower(message_name) NOT LIKE '%welcome%'
+  AND lower(message_name) NOT LIKE '%makerplace%'
+  AND upper(message_name) NOT LIKE '%_QUE%'
+  AND upper(message_name) NOT LIKE '%_CAN%'
+GROUP BY 1
+ORDER BY send_date DESC
+LIMIT 15;
 ```
 
-Also fetch the date range for the week label:
-```sql
-SELECT MIN(day_dt) AS week_start, MAX(day_dt) AS week_end
-FROM cdp_unification_mk.bq_date_dim
-WHERE wk_idnt = '{input_week}';
-```
-
-Use the returned `wk_idnt` as `{input_week}` in the queries below.
+Present the list and ask: **"Which campaign would you like to analyze?"**
 
 ---
 
-## Step 2: Run queries in parallel
+## Step 1: Resolve campaign date range
 
-### Q1 — Overall Metrics + Segment Breakdown
+Get the send window for `{input_campaign}` — used to anchor the attribution window:
+
 ```sql
-WITH TY_week_messages AS (
-    SELECT DISTINCT message_name
-    FROM mk_src.attentive_general_histunion a
-    JOIN mk_src.bq_date_dim b ON substring(a.timestamp,1,10) = b.day_dt
-    WHERE b.wk_idnt = '{input_week}'
-      AND a.type = 'MESSAGE_RECEIPT'
-      AND (lower(message_name) NOT LIKE '%welcome%'
-           AND lower(message_name) NOT LIKE '%% off%'
-           AND lower(message_name) NOT LIKE '%makerplacesellerevent%'
-           AND lower(message_name) NOT LIKE '%makerplace%'
-           AND upper(message_name) NOT LIKE '%_QUE%'
-           AND upper(message_name) NOT LIKE '%_CAN%')
-),
-SMS_Raw AS (
+SELECT
+    MIN(substring(timestamp,1,10)) AS send_start,
+    MAX(substring(timestamp,1,10)) AS send_end
+FROM mk_src.attentive_general_histunion
+WHERE message_name = '{input_campaign}'
+  AND type = 'MESSAGE_RECEIPT';
+```
+
+Store `send_start` and `send_end`. The 7-day attribution window runs from `send_start` to `send_start + 7 days`.
+
+---
+
+## Step 2: Run all queries in parallel
+
+### Q1 — Campaign Engagement Metrics
+
+```sql
+WITH campaign_raw AS (
     SELECT
-        a.phone,
-        a.message_name,
-        CASE WHEN (upper(a.message_name) LIKE '%WALLET%'
-                   OR lower(a.message_name) LIKE '%journey%'
-                   OR lower(a.message_name) LIKE '%abandon%')
-             THEN 'Journey/Trigger'
-             ELSE 'Mass'
-        END AS message_segment,
-        COUNT(DISTINCT CASE WHEN a.type = 'MESSAGE_RECEIPT' THEN a.timestamp END) AS sends,
-        COUNT(DISTINCT CASE WHEN a.type = 'MESSAGE_LINK_CLICK' THEN a.timestamp END) AS clicks
-    FROM mk_src.attentive_general_histunion a
-    JOIN mk_src.bq_date_dim b ON substring(a.timestamp,1,10) = b.day_dt
-    JOIN TY_week_messages wm ON a.message_name = wm.message_name
-    WHERE b.wk_idnt = '{input_week}'
-    GROUP BY 1, 2, 3
-),
-segment_summary AS (
-    SELECT
-        message_segment,
-        SUM(sends) AS total_sends,
-        SUM(clicks) AS total_clicks,
-        ROUND(100.0 * SUM(clicks) / NULLIF(SUM(sends), 0), 2) AS click_rate_pct
-    FROM SMS_Raw
+        phone,
+        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN timestamp END) AS sends,
+        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_LINK_CLICK' THEN timestamp END) AS clicks,
+        MIN(CASE WHEN type = 'MESSAGE_LINK_CLICK' THEN CAST(substring(timestamp,1,10) AS DATE) END) AS first_click_date
+    FROM mk_src.attentive_general_histunion
+    WHERE message_name = '{input_campaign}'
+      AND type IN ('MESSAGE_RECEIPT','MESSAGE_LINK_CLICK')
+    GROUP BY 1
+)
+SELECT
+    COUNT(DISTINCT phone) AS unique_recipients,
+    SUM(sends) AS total_sends,
+    SUM(clicks) AS total_clicks,
+    COUNT(DISTINCT CASE WHEN clicks > 0 THEN phone END) AS unique_clickers,
+    ROUND(100.0 * SUM(clicks) / NULLIF(SUM(sends), 0), 2) AS click_rate_pct,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN clicks > 0 THEN phone END)
+        / NULLIF(COUNT(DISTINCT phone), 0), 2) AS unique_click_rate_pct
+FROM campaign_raw;
+```
+
+### Q2 — Click-Attributed Revenue (7-day window)
+
+Uses the attribution logic: clicker phones → `enrich_attentive_optstatus` → `crafter_id` → `enrich_resa_transaction_head_fact` within 7 days of first click.
+
+```sql
+WITH clickers AS (
+    SELECT phone, MIN(CAST(time AS BIGINT)) AS first_click_time
+    FROM mk_src.attentive_general_histunion
+    WHERE message_name = '{input_campaign}'
+      AND type = 'MESSAGE_LINK_CLICK'
+      AND substring(timestamp,1,10) BETWEEN '{send_start}' AND '{send_end}'
     GROUP BY 1
 ),
-total_summary AS (
-    SELECT
-        SUM(sends) AS total_sends,
-        SUM(clicks) AS total_clicks,
-        ROUND(100.0 * SUM(clicks) / NULLIF(SUM(sends), 0), 2) AS click_rate_pct,
-        COUNT(DISTINCT phone) AS unique_recipients
-    FROM (SELECT phone, SUM(sends) AS sends, SUM(clicks) AS clicks FROM SMS_Raw GROUP BY 1) t
+clicker_crafters AS (
+    SELECT DISTINCT c.phone, c.first_click_time, o.crafter_id
+    FROM clickers c
+    JOIN cdp_unification_mk.enrich_attentive_optstatus o
+      ON c.phone = o.phone
+    WHERE o.crafter_id IS NOT NULL AND o.crafter_id <> ''
+      AND o.opt_in_status = 'join'
 )
-SELECT 'TOTAL' AS segment, total_sends, total_clicks, click_rate_pct, unique_recipients
-FROM total_summary
-UNION ALL
-SELECT message_segment, total_sends, total_clicks, click_rate_pct, NULL
-FROM segment_summary
-ORDER BY segment;
+SELECT
+    COUNT(DISTINCT cc.crafter_id) AS customers,
+    COUNT(DISTINCT t.transaction_id) AS transactions,
+    ROUND(SUM(t.trans_total_amt), 2) AS revenue,
+    ROUND(SUM(t.trans_total_amt) / NULLIF(COUNT(DISTINCT t.transaction_id), 0), 2) AS aov,
+    ROUND(SUM(t.trans_total_amt) / NULLIF(COUNT(DISTINCT cc.crafter_id), 0), 2) AS rev_per_clicker
+FROM clicker_crafters cc
+JOIN cdp_unification_mk.enrich_resa_transaction_head_fact t
+  ON cc.crafter_id = t.crafter_id
+WHERE t.time BETWEEN cc.first_click_time AND cc.first_click_time + 7*86400
+  AND t.trans_total_amt > 0;
 ```
 
-### Q2 — Subscriber Count (as of this week)
+> **Attribution:** 7-day post first-click window. Identity bridge via `enrich_attentive_optstatus` (opt-in only). Single-touch last-click. `trans_total_amt > 0` excludes returns.
+
+### Q3 — Baseline: Similar Send-Size Campaigns (last 90 days)
+
+Finds campaigns with similar audience size (within ±30% of this campaign's sends) sent in the last 90 days, excluding the current campaign. Uses these for baseline click rate, click-attributed revenue, and AOV comparisons.
+
 ```sql
-SELECT COUNT(DISTINCT a.phone) AS total_subscribers
-FROM mk_src.attentive_optstatus a
-JOIN mk_src.bq_date_dim b ON substring(a.timestamp,1,10) = b.day_dt
-WHERE CAST(b.wk_idnt AS INT) <= CAST('{input_week}' AS INT)
-  AND opt_in_status = 'JOIN';
+WITH this_campaign AS (
+    SELECT
+        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN phone END) AS this_sends,
+        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_LINK_CLICK' THEN phone END) AS this_clicks
+    FROM mk_src.attentive_general_histunion
+    WHERE message_name = '{input_campaign}'
+      AND type IN ('MESSAGE_RECEIPT','MESSAGE_LINK_CLICK')
+),
+peer_sends AS (
+    SELECT
+        message_name,
+        MIN(substring(timestamp,1,10)) AS send_date,
+        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN phone END) AS sends,
+        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_LINK_CLICK' THEN phone END) AS clicks
+    FROM mk_src.attentive_general_histunion
+    WHERE type IN ('MESSAGE_RECEIPT','MESSAGE_LINK_CLICK')
+      AND message_name != '{input_campaign}'
+      AND (upper(message_name) LIKE 'MASS%' OR upper(message_name) LIKE 'PROMO%')
+      AND lower(message_name) NOT LIKE '%welcome%'
+      AND lower(message_name) NOT LIKE '%makerplace%'
+      AND upper(message_name) NOT LIKE '%_QUE%'
+      AND upper(message_name) NOT LIKE '%_CAN%'
+      AND substring(timestamp,1,10) >= CAST(DATE_ADD('day', -90, DATE('{send_start}')) AS VARCHAR)
+      AND substring(timestamp,1,10) <= '{send_end}'
+    GROUP BY 1
+),
+peers AS (
+    SELECT ps.*
+    FROM peer_sends ps
+    CROSS JOIN this_campaign tc
+    WHERE ps.sends BETWEEN tc.this_sends * 0.7 AND tc.this_sends * 1.3
+      AND ps.sends > 0
+),
+peer_revenue AS (
+    SELECT
+        p.message_name,
+        p.sends,
+        p.clicks,
+        ROUND(100.0 * p.clicks / NULLIF(p.sends, 0), 2) AS click_rate_pct,
+        rev.revenue,
+        rev.customers,
+        rev.transactions,
+        ROUND(rev.revenue / NULLIF(rev.customers, 0), 2) AS rev_per_clicker,
+        ROUND(rev.revenue / NULLIF(rev.transactions, 0), 2) AS aov
+    FROM peers p
+    LEFT JOIN (
+        SELECT
+            a_clickers.message_name,
+            COUNT(DISTINCT cc.crafter_id) AS customers,
+            COUNT(DISTINCT t.transaction_id) AS transactions,
+            ROUND(SUM(t.trans_total_amt), 2) AS revenue
+        FROM (
+            SELECT
+                message_name,
+                phone,
+                MIN(CAST(time AS BIGINT)) AS first_click_time
+            FROM mk_src.attentive_general_histunion
+            WHERE type = 'MESSAGE_LINK_CLICK'
+              AND message_name IN (SELECT message_name FROM peers)
+            GROUP BY 1, 2
+        ) a_clickers
+        JOIN cdp_unification_mk.enrich_attentive_optstatus o
+          ON a_clickers.phone = o.phone
+         AND o.crafter_id IS NOT NULL AND o.crafter_id <> ''
+         AND o.opt_in_status = 'join'
+        JOIN cdp_unification_mk.enrich_resa_transaction_head_fact t
+          ON o.crafter_id = t.crafter_id
+         AND t.time BETWEEN a_clickers.first_click_time AND a_clickers.first_click_time + 7*86400
+         AND t.trans_total_amt > 0
+        GROUP BY 1
+    ) rev ON p.message_name = rev.message_name
+)
+SELECT
+    COUNT(*) AS peer_campaign_count,
+    APPROX_PERCENTILE(click_rate_pct, 0.5) AS median_click_rate_pct,
+    AVG(click_rate_pct) AS avg_click_rate_pct,
+    APPROX_PERCENTILE(COALESCE(revenue, 0), 0.5) AS median_revenue,
+    AVG(COALESCE(revenue, 0)) AS avg_revenue,
+    APPROX_PERCENTILE(COALESCE(rev_per_clicker, 0), 0.5) AS median_rev_per_clicker,
+    AVG(COALESCE(rev_per_clicker, 0)) AS avg_rev_per_clicker,
+    APPROX_PERCENTILE(COALESCE(aov, 0), 0.5) AS median_aov,
+    AVG(COALESCE(aov, 0)) AS avg_aov
+FROM peer_revenue;
 ```
+
+> **Baseline peer logic:** Mass/Promo campaigns only, last 90 days, within ±30% of this campaign's send volume. Click-attributed revenue computed with identical 7-day attribution window.
 
 ---
 
-## Dashboard Output
+## Step 3: Dashboard Output
 
-Render a clean single-page HTML dashboard with:
+Render a self-contained single-page HTML dashboard.
 
-**Header:** "SMS Performance — Fiscal Week {input_week} ({week_start} → {week_end})"
+**Header:** "SMS Campaign Analysis — {input_campaign}" with send date below.
 
-**KPI Cards (row of 4):**
+### Tab 1 — Overview
+
+**KPI row (6 tiles):**
 - Total Sends
-- Total Clicks
-- Click Rate (%)
-- Total Subscribers
+- Unique Clickers
+- Click Rate (unique clickers / sends, %)
+- Click-Attributed Revenue
+- Transactions
+- AOV
 
-**Segment Breakdown Table:**
+**Engagement vs Baseline comparison table:**
 
-| Segment | Sends | Clicks | Click Rate |
-|---------|-------|--------|------------|
-| Mass | ... | ... | ...% |
-| Journey/Trigger | ... | ... | ...% |
-| **Total** | ... | ... | ...% |
+| Metric | This Campaign | Baseline Median | vs Baseline |
+|--------|---------------|-----------------|-------------|
+| Click Rate | x% | x% | +/- bps |
+| Revenue | $x | $x | +/- % |
+| Rev / Clicker | $x | $x | +/- % |
+| AOV | $x | $x | +/- % |
 
-**Bar Chart:** Sends vs Clicks side-by-side for Mass and Journey/Trigger segments.
+Show baseline peer count (e.g. "vs 8 similar campaigns in last 90 days").
 
-**Design:** Professional, clean, minimal. Neutral palette. Use inline CSS — no external dependencies.
+> **Delta display:** Click rate delta in bps (basis points). Revenue/AOV/Rev per clicker deltas as %.
+
+### Tab 2 — Baseline Detail
+
+Show each peer campaign as a row:
+
+| Campaign | Send Date | Sends | Click Rate | Revenue | AOV |
+|----------|-----------|-------|------------|---------|-----|
+| ...      | ...       | ...   | ...%       | $...    | $.. |
+
+Sorted by send date descending. Helps the user see which peer campaigns were included.
+
+---
+
+## Calculated Metrics
+
+- **Click Rate:** `Unique Clickers / Sends`
+- **Conv Rate:** `Customers (buyers) / Unique Clickers`
+- **Rev / Clicker:** `Revenue / Unique Clickers`
+- **AOV:** `Revenue / Transactions`
+- **bps delta:** `(campaign% − baseline%) × 100`
+- **% delta:** `(campaign − baseline) / baseline × 100`
+
+---
+
+## Data Tables Reference
+
+| Table | Purpose |
+|---|---|
+| `mk_src.attentive_general_histunion` | Raw SMS events — sends, clicks. Filter on `message_name` + `type`. |
+| `mk_src.attentive_optstatus` | Subscriber opt-in status and current subscriber count. |
+| `cdp_unification_mk.enrich_attentive_optstatus` | Phone → `crafter_id` bridge. Use `opt_in_status = 'join'` only. |
+| `cdp_unification_mk.enrich_resa_transaction_head_fact` | Transaction header. Has `crafter_id`, `time` (Unix epoch), `trans_total_amt`, `transaction_id`. |
+| `cdp_unification_mk.bq_date_dim` | Calendar / fiscal week dimension. |
+
+> **Attribution window:** 7 days post first click (Unix epoch: `first_click_time + 7*86400`). Exclude returns with `trans_total_amt > 0`.
